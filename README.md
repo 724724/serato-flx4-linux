@@ -1,107 +1,102 @@
-# serato-dj808-linux
+# serato-flx4-linux
 
-Makes **Roland DJ-808** and **Roland DJ-505** (and likely other Roland/BOSS USB MIDI controllers)
-work with **Serato DJ Pro** (2.5.112) running under **Wine** on Linux.
+Makes the **Pioneer DDJ-FLX4** work in **hardware mode** with **Serato DJ Pro**
+running under **Wine** on Linux.
 
 No Windows. No dual-boot. No VM.
 
-This has not been tested with 3.x or 4.x 
+Forked from [anolis/serato-dj808-linux](https://github.com/anolis/serato-dj808-linux),
+which targets the Roland DJ-808/505. This fork drops the Roland-specific pieces
+(ASIO stubs, `.exe` binary patches) — the FLX4 doesn't need them — and adds the
+`winealsa.so` / `winmm.dll` patches required to make Serato associate the FLX4's
+MIDI port with its USB device.
+
+> **Status:** MIDI + USB + HID hardware connection works — Serato reports
+> `***CONNECTED*** Pioneer DDJ-FLX4`. Licensing (see below) is separate from
+> hardware detection.
+
 ---
 
 ## Supported hardware
 
 | Controller | VID | PID | Status |
 |---|---|---|---|
-| Roland DJ-808 | `0x0582` | `0x01C9` | Working |
-| Roland DJ-505 | `0x0582` | `0x0208` | Working |
+| Pioneer DDJ-FLX4 | `0x2B73` | `0x0045` | Hardware connects |
 
-## Supported Serato versions
+> **Check your PID.** Run `lsusb | grep -i 2b73`. Some units report a different
+> PID; if yours isn't `0045`, change it in `wine-flx4.patch` and `apply.sh`.
 
-| Version | Status |
-|---|---|
-| 2.5.12 | Fully patched — binary patches + all hooks |
-| Others | Hooks and libusb stub applied; binary patches skipped |
+## Why the FLX4 is different from the Roland controllers
 
-> **Note on 4.0.x subscriptions:** Serato DJ Pro 4.0 requires an active
-> subscription even if your controller shipped with a perpetual license.
-> Version 2.x / 3.x supports perpetual hardware-unlock licenses.
-> If you have a perpetual license, install one of those versions instead.
-
----
-
-## Background
-
-Serato DJ Pro uses `libusb` to identify connected hardware controllers.
-Under Wine on Linux, the libusb→kernel USB path relies on `CM_Get_Parent`,
-which Wine stubs out. As a result, Serato finds the controller's USB device but
-can never read its VID/PID, so the device aggregation loop retries forever
-(tens of thousands of times per session) and the controller never connects.
-
-Once USB detection is fixed, two more things are needed for full hardware mode:
-
-- **MIDI identification** — Serato matches the MIDI device to the USB device by
-  querying `DRV_QUERYDEVICEINTERFACE`, which must return a USB interface path
-  containing the correct VID/PID. Without this, Serato finds the MIDI port but
-  treats it as an unknown device.
-
-- **ASIO audio driver** — Serato starts audio through a Roland ASIO COM driver
-  (`RDAS*.DLL`). The real driver talks to Roland's kernel USB audio driver,
-  which doesn't exist under Wine. A stub DLL implements the full IASIO vtable
-  and drives Serato's audio engine via the `bufferSwitch` callback, routing
-  output to the default waveOut device.
-
-This patcher applies all of these fixes.
+- **No ASIO stub needed.** The FLX4 is a USB audio/MIDI class-compliant device.
+  Serato picks up its audio through the normal Windows Audio (WASAPI/waveOut)
+  path Wine already provides, so there is no Roland-style kernel ASIO driver to
+  fake. The `RDAS*.DLL` stubs from the original repo are removed.
+- **No `.exe` binary patches needed.** The FLX4 aggregates without the vtable
+  gate-check NOP patches the DJ-808 required.
+- **The hard part is MIDI ↔ USB association**, which is fixed entirely at the
+  Wine level (`winealsa.so` + `winmm.dll`), independent of the Serato version.
 
 ---
 
-## What the patcher does
+## Background — the four walls
 
-### 1. Custom `libusb-1.0.dll`
+Getting the FLX4 into Serato hardware mode means clearing four separate barriers:
+
+1. **USB detection.** Serato uses `libusb` to read a controller's VID/PID. Under
+   Wine the libusb→kernel path relies on `CM_Get_Parent`, which Wine stubs out,
+   so the aggregation loop retries forever. The custom `libusb-1.0.dll` (from the
+   original repo's `patch.sh`) reads VID/PID from the Wine registry and confirms
+   presence via Linux sysfs instead.
+
+2. **MIDI device interface (OUT).** Serato matches the MIDI port to the USB
+   device by calling `DRV_QUERYDEVICEINTERFACE` on the MIDI output, expecting a
+   USB interface path that contains the VID/PID. Stock `winealsa` doesn't
+   implement this selector, so the path comes back empty and the MIDI port shows
+   as `vid=0000&pid=0000`.
+
+3. **MIDI device interface (IN).** Serato never sends
+   `DRV_QUERYDEVICEINTERFACE` to the MIDI **input** — Wine's `winmm.dll`
+   `midiInMessage` is missing the `MMDRV_PhysicalFeatures` fallback that
+   `midiOutMessage` has, so the query never reaches the driver. Without this the
+   IN side stays `vid=0000`, the IN/OUT connections get different
+   `unique_group`s, and Serato never merges them into one duplex device.
+
+4. **Duplex merge.** Once IN and OUT both report `vid=2b73&pid=0045` via the
+   same interface path, Serato collapses them into a single
+   `direction=duplex` connection and enters hardware mode.
+
+---
+
+## What this fork changes
+
+### 1. Custom `libusb-1.0.dll` (unchanged, from `patch.sh`)
 Reads VID/PID directly from Wine's device registry
-(`SYSTEM\CurrentControlSet\Enum\USB`) instead of using kernel USB ioctls.
-Also checks Linux sysfs to confirm the device is physically present, so
-Serato doesn't try to aggregate a controller that isn't plugged in.
+(`SYSTEM\CurrentControlSet\Enum\USB`) and checks Linux sysfs to confirm the
+device is physically present.
 
-### 2. LD_PRELOAD hook
-Intercepts `open()`/`openat()` in the Wine loader and redirects specific DLL
-paths to our patched copies, without touching your system Wine installation.
+### 2. `winealsa.so` — MIDI VID/PID injection (`wine-flx4.patch`)
+Two additions to `dlls/winealsa.drv/alsamidi.c`:
 
-### 3. ASIO stub DLLs
-Fake Roland ASIO COM drivers that implement the full IASIO vtable:
-
-| DLL | Device | Channels | CLSID |
-|---|---|---|---|
-| `RDAS1174.DLL` | DJ-808 | 8 in / 8 out | `{D6FB76C2-9C4E-4d46-92F3-649672C65096}` |
-| `RDAS1197.DLL` | DJ-505 | 8 in / 6 out | `{8CEA6E64-A172-4bd4-8A9A-0204E73C4005}` |
-
-Both stubs report 1024-sample buffers at 48000 Hz, route output to the default
-waveOut device, and use the exact channel names from the real Roland drivers.
-
-### 4. MIDI VID/PID injection (`winealsa.so` patch)
-Wine's ALSA MIDI driver reports `wMid=0` / `wPid=0` for all devices.
-A patched `winealsa.so` injects the correct Roland VID/PID into the MIDI
-capabilities structs based on the ALSA port name, and overrides
-`DRV_QUERYDEVICEINTERFACE` to return the correct USB interface path:
-
+- **`DRV_QUERYDEVICEINTERFACE` / `...SIZE`** handling in both
+  `alsa_midi_out_message` and `alsa_midi_in_message`. When the ALSA port name
+  contains `FLX4`, returns the USB interface path:
 ```
-\\?\USB#VID_0582&PID_01C9#512&256&1&6#{A5DCBF10-6530-11D2-901F-00C04FB951ED}  (DJ-808)
-\\?\USB#VID_0582&PID_0208#512&256&1&0#{A5DCBF10-6530-11D2-901F-00C04FB951ED}  (DJ-505)
+  \\?\USB#VID_2B73&PID_0045#512&256&1&0#{A5DCBF10-6530-11D2-901F-00C04FB951ED}
 ```
+- **`wMid` / `wPid` injection** in `midi_in_get_devcaps` /
+  `midi_out_get_devcaps` (`0x2b73` / `0x0045`) as a belt-and-suspenders measure
+  for the `MIDIINCAPS` / `MIDIOUTCAPS` path.
 
-Serato parses this path to extract the VID/PID of the MIDI device and match
-it against the USB device it detected. Without this, MIDI and USB are never
-associated and hardware mode never activates.
+### 3. `winmm.dll` — `midiInMessage` fallback (`wine-flx4.patch`)
+Adds the `MMDRV_PhysicalFeatures` fallback to `midiInMessage` in
+`dlls/winmm/winmm.c`, mirroring the one already present in `midiOutMessage`.
+This is what lets `DRV_QUERYDEVICEINTERFACE` reach the driver on the MIDI **input**
+side, so IN and OUT end up with the same interface path and merge into one
+duplex device.
 
-### 5. Binary patches to `Serato DJ Pro.exe` *(version-specific)*
-Five NOP patches bypass vtable gate-checks in the USB aggregation function.
-These checks return 0 when no MIDI connection is established yet, causing the
-aggregation loop to skip its device search entirely. The patches make the
-searches run unconditionally on the first attempt.
-
-### 6. OAuth URI handler
-Registers `seratodjpro://` as a Linux xdg scheme so that the login flow
-(Firefox → `id.serato.com` → redirect back to app) completes instead of
-silently failing.
+> This is the piece the original repo's README described ("patched
+> `winealsa.so`") but did not actually ship. It is implemented here.
 
 ---
 
@@ -109,87 +104,73 @@ silently failing.
 
 | Package | Purpose |
 |---|---|
-| `wine` (WineHQ stable ≥ 10) | Runs Serato |
-| `gcc` | Builds the LD_PRELOAD hook and winealsa patch |
-| `mingw-w64` | Cross-compiles the libusb + ASIO stubs (Windows DLLs) |
-| `python3` | Applies binary patches |
-| `xdg-utils` | Registers the OAuth URI handler |
+| `wine` (WineHQ stable, 10.0 tested) | Runs Serato |
+| `gcc` | Builds the libusb stub / LD_PRELOAD hook |
+| `mingw-w64` | Cross-compiles the libusb stub (Windows DLL) |
+| `python3`, `xdg-utils` | Used by `patch.sh` |
+| Wine build deps + `alsa-lib` | Only if rebuilding `winealsa.so` / `winmm.dll` |
 
-On Debian/Ubuntu:
+On Arch:
 ```bash
-sudo apt install wine-stable gcc mingw-w64 python3 xdg-utils
+sudo pacman -S --needed wine mingw-w64-gcc python xdg-utils base-devel alsa-lib
 ```
 
 ---
 
 ## Usage
 
-1. Install Serato DJ Pro for Windows into your Wine prefix as normal.
-2. Run the patcher:
+### 1. Install Serato DJ Pro into your Wine prefix as normal.
 
+### 2. Build/deploy the libusb stub (from the original patcher)
 ```bash
 chmod +x patch.sh
-./patch.sh
+./patch.sh --wineprefix ~/.wine
 ```
+`patch.sh` builds and deploys the `libusb-1.0.dll` stub. Its Roland ASIO / USB
+registration and `.exe` binary-patch steps are harmless no-ops for the FLX4
+(they either skip on an unknown Serato version or register unused devices).
 
-3. Launch Serato:
-
+### 3. Deploy the Wine DLL patches + register the FLX4 USB device
 ```bash
-~/.local/bin/serato-dj-pro
+chmod +x apply.sh
+./apply.sh
 ```
+`apply.sh` copies the prebuilt `winealsa.so` / `winmm.dll` into your system Wine
+(backing up the originals as `*.orig`) and adds the FLX4 USB entry to the Wine
+registry.
 
-Or use the **Serato DJ Pro** shortcut in your application menu.
+> **Prebuilt binaries are Wine-version-specific.** They were built against the
+> version in `prebuilt/WINE_VERSION.txt`. If your Wine differs, **rebuild** (see
+> below) — a mismatched `winealsa.so` will fail to load with an ELF/ABI error.
+
+### 4. Launch Serato and connect the FLX4.
+
+To revert the Wine DLL changes:
+```bash
+./restore.sh
+```
 
 ---
 
-### Patcher options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--wineprefix PATH` | `~/.wine` | Path to the Wine prefix where Serato is installed |
-| `--wine-bin PATH` | `wine` (from `$PATH`) | Path to the Wine binary, e.g. `/opt/wine-stable/bin/wine` |
-| `--music-dir PATH` | *(current Wine "My Music" mapping)* | Linux path to your music library root — the directory that contains (or should contain) your `_Serato_` folder. Sets Wine's "My Music" shell folder so crates and library data are written to the right place. If you have an existing Serato library on an external drive, point this at the drive root, e.g. `/media/youruser/MyDrive`. |
-| `--dry-run` | off | Print every action without making any changes |
-| `--help` / `-h` | | Show usage and exit |
-
-**Common examples:**
+## Rebuilding the Wine patches (if your Wine version differs)
 
 ```bash
-# Non-default Wine prefix and binary (e.g. WineHQ stable alongside system Wine)
-./patch.sh --wineprefix ~/.wine-serato --wine-bin /opt/wine-stable/bin/wine
+# Get the matching Wine source (match your installed version)
+git clone --depth 1 -b wine-10.0 https://github.com/wine-mirror/wine.git ~/wine-build
+cd ~/wine-build
+git apply /path/to/serato-flx4-linux/wine-flx4.patch
 
-# Point Serato at an external drive music library
-./patch.sh --music-dir /media/youruser/MyDrive
+./configure --enable-win64
+make dlls/winealsa.drv/winealsa.so
+make dlls/winmm/x86_64-windows/winmm.dll
 
-# Preview everything without touching anything
-./patch.sh --dry-run
+# Deploy (adjust paths to your distro's Wine layout)
+sudo cp dlls/winealsa.drv/winealsa.so          /usr/lib/wine/x86_64-unix/winealsa.so
+sudo cp dlls/winmm/x86_64-windows/winmm.dll    /usr/lib/wine/x86_64-windows/winmm.dll
 ```
 
-> **Re-running the patcher is safe.** All steps are idempotent — DLLs are
-> rebuilt and redeployed, registry keys are overwritten, and the launch wrapper
-> is regenerated. Run it again any time you update Wine or reinstall Serato.
-
----
-
-### Launch wrapper
-
-The patcher writes `~/.local/bin/serato-dj-pro`, a small script that sets the
-required environment and launches Serato:
-
-```bash
-export WINEPREFIX=~/.wine
-export LD_PRELOAD=~/.local/share/serato-dj808-linux/wine_open_hook.so
-exec wine "C:\Program Files\Serato\Serato DJ Pro\Serato DJ Pro.exe"
-```
-
-The `LD_PRELOAD` hook is **required** — without it the Wine loader picks up the
-system `winmm.dll` instead of the patched copy, and the MIDI device reports the
-wrong VID/PID, causing Serato to create split IN/OUT MIDI connections instead of
-a single duplex one. That breaks the firmware handshake and hardware mode never
-activates.
-
-If you need to launch Serato from a script or another launcher, make sure it
-either calls `~/.local/bin/serato-dj-pro` or sets `LD_PRELOAD` itself.
+The full tree build (`make`) may fail on unrelated test binaries (e.g. dwrite
+tests); building the two targets above directly avoids that.
 
 ---
 
@@ -197,138 +178,73 @@ either calls `~/.local/bin/serato-dj-pro` or sets `LD_PRELOAD` itself.
 
 | File | Change |
 |---|---|
-| `<serato-dir>/libusb-1.0.dll` | Replaced with our stub (original saved as `.orig`) |
-| `<serato-dir>/Serato DJ Pro.exe` | Binary-patched (original saved as `.bak_dj808_<ver>`) |
-| `<wine-system32>/RDAS1174.DLL` | DJ-808 ASIO stub (built from `rdas808_stub.c`) |
-| `<wine-system32>/RDAS1197.DLL` | DJ-505 ASIO stub (built from `rdas505_stub.c`) |
-| `~/.local/share/serato-dj808-linux/wine_open_hook.so` | Built and installed |
-| `~/.local/share/serato-dj808-linux/x86_64-windows/` | Patched DLLs cache |
-| `~/.local/bin/serato-dj-pro` | Launch wrapper script |
-| `~/.local/share/applications/serato-dj-pro.desktop` | Desktop shortcut |
-| `~/.local/share/applications/seratodjpro-handler.desktop` | OAuth URI handler |
-| Wine registry `HKCR\seratodjpro` | OAuth callback scheme |
-| Wine registry `HKLM\SOFTWARE\ASIO\DJ-808 ASIO` | ASIO driver registration |
-| Wine registry `HKLM\SOFTWARE\ASIO\DJ-505 ASIO` | ASIO driver registration |
-| Wine registry `HKLM\SYSTEM\...\Enum\USB\VID_0582&PID_01C9` | USB device entry for DJ-808 |
-| Wine registry `HKLM\SYSTEM\...\Enum\USB\VID_0582&PID_0208` | USB device entry for DJ-505 |
+| `<serato-dir>/libusb-1.0.dll` | Replaced with stub via `patch.sh` (original saved as `.orig`) |
+| `/usr/lib/wine/x86_64-unix/winealsa.so` | Patched (original saved as `.orig` by `apply.sh`) |
+| `/usr/lib/wine/x86_64-windows/winmm.dll` | Patched (original saved as `.orig` by `apply.sh`) |
+| Wine registry `HKLM\SYSTEM\...\Enum\USB\VID_2B73&PID_0045` | FLX4 USB device entry |
 
 ---
 
-## Tested on
+## Verifying
 
-- Debian 13 (trixie) / Wine 11.0 (WineHQ stable) / kernel 6.12
-- Roland DJ-808 (VID `0x0582`, PID `0x01C9`) — Serato DJ Pro 2.5.12
-- Roland DJ-505 (VID `0x0582`, PID `0x0208`) — Serato DJ Pro 2.5.12
-
----
-
-## How the binary patches work
-
-The aggregation function at VA `0x141a3b890` in 2.5.12 has three search paths,
-each guarded by a vtable call on the USB device object. The guards check
-whether a MIDI connection is already established in the corresponding direction
-before running the search. On first connection these all return 0, so no search
-ever runs and the loop sleeps and retries indefinitely.
-
-The five patches:
-
-| Name | File offset | Original | Patched | Effect |
-|---|---|---|---|---|
-| agg9a | `0x1a3fa1a` | `0f 84 …` (JE) | `90 90 90 90 90 90` | bypass direction==3 guard (1) |
-| agg9b | `0x1a3fa2d` | `0f 84 …` (JE) | `90 90 90 90 90 90` | bypass direction==3 guard (2) |
-| agg10a | `0x1a3bf3b` | `74 11` (JE) | `90 90` | vtable[2] gate — primary search |
-| agg10b | `0x1a3c192` | `74 11` (JE) | `90 90` | vtable[3] gate — secondary search |
-| agg10c | `0x1a3c4a4` | `74 11` (JE) | `90 90` | vtable[5] gate — tertiary search |
-
----
-
-## DJ-808 aggregation flow (for contributors)
-
-The full chain that must succeed for Serato to enter hardware mode:
-
+Run Serato with MIDI tracing and watch for the FLX4 connecting:
+```bash
+WINEDEBUG=+midi wine "C:\Program Files\Serato\Serato DJ Pro\Serato DJ Pro.exe" 2>&1 | tee /tmp/serato.log
+grep -E "vid=2b73|direction=duplex|CONNECTED" /tmp/serato.log
 ```
-libusb USB scan
-  → reads HKLM\SYSTEM\...\Enum\USB\VID_0582&PID_01C9\512&256&1&6
-  → checks /sys/bus/usb/devices/ to confirm device is physically present
-  → fires "New USB Connection" in Serato
-
-Serato aggregation loop  [binary patches required — see below]
-  → "New USB device plugged-in: Roland DJ-808"
-  → queries MIDI devices for one with matching VID/PID
-    → winealsa DRV_QUERYDEVICEINTERFACE returns interface path containing PID_01C9
-  → "Firmware supported, device: DJ-808"
-  → CNativeMixer : kConnectedMode : hardware=DJ-808
-  → Deck Manager : Dual Control enabled : 1
-
-ASIO audio start
-  → CoCreateInstance({D6FB76C2-9C4E-4d46-92F3-649672C65096}) → RDAS1174.DLL
-  → createBuffers(nch=12)  [4 inputs + 8 outputs]
-  → ASIOStart → callback thread begins calling bufferSwitch
-  → "Audio Connection to Device: DJ-808 succeeded"
+Success looks like:
+```
+New MIDI Connection: DDJ-FLX4 ... pid=0045 & vid=2b73 & direction=duplex
+***CONNECTED*** Pioneer DDJ-FLX4 VID: 0x2b73 PID: 0x0045
 ```
 
-Key implementation notes:
-- The DJ-808 requires the five `.exe` binary patches (see below). Without them,
-  the vtable gate-checks in the aggregation function all return 0 on first
-  connection and the loop retries indefinitely (~78,000 times per session).
-- `RDAS1174.DLL` reports 4 inputs and 8 outputs (4 stereo pairs, one per deck).
-  `MAX_CH=16` in the stub covers the full `nch=12` createBuffers request.
-- The DJ-808 MIDI port appears as `direction=duplex` in Serato, same as the
-  DJ-505. The USB instance ID suffix is `&6` (vs `&0` for the DJ-505) —
-  this comes from the `DRV_QUERYDEVICEINTERFACE` path and must match what is
-  registered in the Wine USB registry.
-- Audio preferred buffer size is 1024 samples (23 ms). 512 samples causes
-  audible crackling under Wine's waveOut timing.
-
 ---
 
-## DJ-505 aggregation flow (for contributors)
-
-The full chain that must succeed for Serato to enter hardware mode:
+## Aggregation flow (for contributors)
 
 ```
-libusb USB scan
-  → reads HKLM\SYSTEM\...\Enum\USB\VID_0582&PID_0208\512&256&1&0
-  → checks /sys/bus/usb/devices/ to confirm device is physically present
-  → fires "New USB Connection" in Serato
+libusb USB scan (stub)
+  → reads HKLM\SYSTEM\...\Enum\USB\VID_2B73&PID_0045\512&256&1&0
+  → confirms presence via /sys/bus/usb/devices/
+  → "New USB Connection: Vid=0x2b73&Pid=0x45"
 
-Serato aggregation loop
-  → "New USB device plugged-in: Roland DJ-505"
-  → queries MIDI devices for one with matching VID/PID
-    → winealsa DRV_QUERYDEVICEINTERFACE returns interface path containing PID_0208
-  → "Firmware supported, device: DJ-505"
-  → CNativeMixer : kConnectedMode : hardware=DJ-505
-  → Deck Manager : Dual Control enabled : 1
+MIDI association
+  → OUT: winmm midiOutMessage → MMDRV_PhysicalFeatures
+         → winealsa DRV_QUERYDEVICEINTERFACE returns path w/ VID_2B73&PID_0045
+  → IN:  winmm midiInMessage → MMDRV_PhysicalFeatures  [added by this fork]
+         → winealsa DRV_QUERYDEVICEINTERFACE returns same path
+  → IN and OUT share unique_group → merged into one direction=duplex connection
 
-ASIO audio start
-  → CoCreateInstance({8CEA6E64-A172-4bd4-8A9A-0204E73C4005}) → RDAS1197.DLL
-  → createBuffers(nch=14)  [8 inputs + 6 outputs]
-  → ASIOStart → callback thread begins calling bufferSwitch
-  → "Audio Connection to Device: DJ-505 succeeded"
+Hardware mode
+  → "***CONNECTED*** Pioneer DDJ-FLX4"
+  → Minimum firmware version installed
 ```
 
-Key implementation notes:
-- `createBuffers` is called with `nch=14` (8 inputs + 6 outputs). The ASIO stub
-  must allocate at least 14 buffer slots (`MAX_CH ≥ 14`). If `MAX_CH=8`, output
-  buffer pointers are left NULL and Serato crashes on the first `bufferSwitch`.
-- Serato uses `direction=duplex` for the DJ-505 MIDI connection (single port,
-  bidirectional), unlike some other devices that enumerate IN and OUT separately.
-- The `NOTV` ("not verified") log message and the sysex handshake that follows
-  are non-fatal — Serato enters `kConnectedMode` regardless and the handshake
-  completes asynchronously with the real hardware.
+Notes:
+- The `winealsa` handler matches on the ALSA port name containing `FLX4`. To
+  support another controller, change the match string, the VID/PID, and the
+  interface path.
+- No `.exe` binary patch is used; the FLX4 aggregates on the first attempts
+  without the DJ-808 vtable-gate NOPs.
 
 ---
 
-## Contributing
+## Licensing note (Serato, not Wine)
 
-If you get it working on another Serato version, controller, or distro — please
-open a PR with the patch offsets and test results. The binary patch table in
-`patch.sh` is designed to be extended with new version entries.
+Hardware detection is independent of your Serato license. The FLX4 is a Serato
+DJ **Lite** hardware-unlock device; using it with Serato DJ **Pro** requires an
+active Pro license/subscription. On Serato DJ Pro 4.0.x this is a subscription
+even if a controller shipped with a perpetual unlock — with an expired/cancelled
+subscription Serato will show the controller as connected but stay in trial/
+unlicensed mode. This is a Serato account matter, not a Wine/patch issue.
 
 ---
 
-## License
+## Credits & License
 
-MIT. The patched DLL sources (`libusb_stub.c`, `wine_open_hook.c`,
-`rdas808_stub.c`, `rdas505_stub.c`) are original work. The binary patches are
-offsets + byte sequences — no Serato code is included or redistributed.
+Forked from [anolis/serato-dj808-linux](https://github.com/anolis/serato-dj808-linux) (MIT).
+The `winealsa.so` / `winmm.dll` changes are provided as a source patch
+(`wine-flx4.patch`) against the Wine tree; Wine is LGPL. No Serato code is
+included or redistributed — only VID/PID values and a MIDI interface path string.
+
+MIT.
