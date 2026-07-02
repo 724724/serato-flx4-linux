@@ -1,0 +1,146 @@
+diff --git a/dlls/winealsa.drv/alsamidi.c b/dlls/winealsa.drv/alsamidi.c
+index fbc65bd..3d70d74 100644
+--- a/dlls/winealsa.drv/alsamidi.c
++++ b/dlls/winealsa.drv/alsamidi.c
+@@ -49,6 +49,8 @@
+ 
+ #include "unixlib.h"
+ 
++static int match_flx4(const WCHAR *s);
++
+ WINE_DEFAULT_DEBUG_CHANNEL(midi);
+ 
+ struct midi_dest
+@@ -920,6 +922,12 @@ static UINT midi_out_get_devcaps(WORD dev_id, MIDIOUTCAPSW *caps, UINT size)
+ 
+     memcpy(caps, &dests[dev_id].caps, min(size, sizeof(*caps)));
+ 
++    if (match_flx4(dests[dev_id].caps.szPname) && size >= sizeof(WORD)*2) {
++        caps->wMid = 0x2b73;
++        caps->wPid = 0x0045;
++        fprintf(stderr, "[FLX4PATCH] OUT devcaps wMid/wPid injected dev_id=%u\n", dev_id);
++    }
++
+     return MMSYSERR_NOERROR;
+ }
+ 
+@@ -1323,6 +1331,12 @@ static UINT midi_in_get_devcaps(WORD dev_id, MIDIINCAPSW *caps, UINT size)
+ 
+     memcpy(caps, &srcs[dev_id].caps, min(size, sizeof(*caps)));
+ 
++    if (match_flx4(srcs[dev_id].caps.szPname) && size >= sizeof(WORD)*2) {
++        caps->wMid = 0x2b73;
++        caps->wPid = 0x0045;
++        fprintf(stderr, "[FLX4PATCH] IN devcaps wMid/wPid injected dev_id=%u\n", dev_id);
++    }
++
+     return MMSYSERR_NOERROR;
+ }
+ 
+@@ -1385,6 +1399,21 @@ static DWORD midi_in_reset(WORD dev_id, struct notify_context *notify)
+     return err;
+ }
+ 
++#ifndef DRV_QUERYDEVICEINTERFACE
++#define DRV_QUERYDEVICEINTERFACE     (0x0800 + 12)  /* 0x80C */
++#define DRV_QUERYDEVICEINTERFACESIZE (0x0800 + 13)  /* 0x80D */
++#endif
++
++/* szPname 안에 "FLX4"가 들어있는지 (unixlib이라 wcsstr 못 씀) */
++static int match_flx4(const WCHAR *s)
++{
++    if (!s) return 0;
++    for (; *s; s++)
++        if (s[0]=='F' && s[1]=='L' && s[2]=='X' && s[3]=='4')
++            return 1;
++    return 0;
++}
++
+ NTSTATUS alsa_midi_out_message(void *args)
+ {
+     struct midi_out_message_params *params = args;
+@@ -1435,6 +1464,32 @@ NTSTATUS alsa_midi_out_message(void *args)
+     case MODM_RESET:
+         *params->err = midi_out_reset(params->dev_id);
+         break;
++    case DRV_QUERYDEVICEINTERFACESIZE:
++    case DRV_QUERYDEVICEINTERFACE:
++    {
++        static const WCHAR flx4_if[] =
++            u"\\\\?\\USB#VID_2B73&PID_0045#512&256&1&0#"
++            u"{A5DCBF10-6530-11D2-901F-00C04FB951ED}";
++        DWORD len = 0, need;
++        while (flx4_if[len]) len++;
++        need = (len + 1) * sizeof(WCHAR);
++        if (params->dev_id < num_dests &&
++            match_flx4(dests[params->dev_id].caps.szPname))
++        {
++            if (params->msg == DRV_QUERYDEVICEINTERFACESIZE) {
++                *(DWORD *)params->param_1 = need;
++                *params->err = MMSYSERR_NOERROR;
++                fprintf(stderr, "[FLX4PATCH] OUT SIZE->%u\n", need);
++            } else {
++                memcpy((void *)params->param_1, flx4_if, need);
++                *params->err = MMSYSERR_NOERROR;
++                fprintf(stderr, "[FLX4PATCH] OUT COPY done, first=%04x len=%u p2=%Ix\n",
++                        ((WCHAR*)params->param_1)[0], need, (unsigned long)params->param_2);
++            }
++        } else
++            *params->err = MMSYSERR_NOTSUPPORTED;
++        break;
++    }
+     default:
+         TRACE("Unsupported message\n");
+         *params->err = MMSYSERR_NOTSUPPORTED;
+@@ -1490,6 +1545,32 @@ NTSTATUS alsa_midi_in_message(void *args)
+     case MIDM_RESET:
+         *params->err = midi_in_reset(params->dev_id, params->notify);
+         break;
++    case DRV_QUERYDEVICEINTERFACESIZE:
++    case DRV_QUERYDEVICEINTERFACE:
++    {
++        static const WCHAR flx4_if[] =
++            u"\\\\?\\USB#VID_2B73&PID_0045#512&256&1&0#"
++            u"{A5DCBF10-6530-11D2-901F-00C04FB951ED}";
++        DWORD len = 0, need;
++        while (flx4_if[len]) len++;
++        need = (len + 1) * sizeof(WCHAR);
++        if (params->dev_id < num_srcs &&
++            match_flx4(srcs[params->dev_id].caps.szPname))
++        {
++            if (params->msg == DRV_QUERYDEVICEINTERFACESIZE) {
++                *(DWORD *)params->param_1 = need;
++                *params->err = MMSYSERR_NOERROR;
++                fprintf(stderr, "[FLX4PATCH] IN SIZE->%u\n", need);
++            } else {
++                memcpy((void *)params->param_1, flx4_if, need);
++                *params->err = MMSYSERR_NOERROR;
++                fprintf(stderr, "[FLX4PATCH] IN COPY done, first=%04x len=%u p2=%Ix\n",
++                        ((WCHAR*)params->param_1)[0], need, (unsigned long)params->param_2);
++            }
++        } else
++            *params->err = MMSYSERR_NOTSUPPORTED;
++        break;
++    }
+     default:
+         TRACE("Unsupported message\n");
+         *params->err = MMSYSERR_NOTSUPPORTED;
+diff --git a/dlls/winmm/winmm.c b/dlls/winmm/winmm.c
+index 73050e0..7bc2e6b 100644
+--- a/dlls/winmm/winmm.c
++++ b/dlls/winmm/winmm.c
+@@ -881,8 +881,12 @@ UINT WINAPI midiInMessage(HMIDIIN hMidiIn, UINT uMessage,
+ 
+     TRACE("(%p, %04X, %08IX, %08IX)\n", hMidiIn, uMessage, dwParam1, dwParam2);
+ 
+-    if ((wmld = MMDRV_Get(hMidiIn, MMDRV_MIDIIN, FALSE)) == NULL)
+-	return MMSYSERR_INVALHANDLE;
++    if ((wmld = MMDRV_Get(hMidiIn, MMDRV_MIDIIN, FALSE)) == NULL) {
++        if ((wmld = MMDRV_Get(hMidiIn, MMDRV_MIDIIN, TRUE)) != NULL) {
++            return MMDRV_PhysicalFeatures(wmld, uMessage, dwParam1, dwParam2);
++        }
++        return MMSYSERR_INVALHANDLE;
++    }
+ 
+     switch (uMessage) {
+     case MIDM_OPEN:

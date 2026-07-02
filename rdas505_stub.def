@@ -1,7 +1,0 @@
-LIBRARY RDAS1197.dll
-EXPORTS
-    DllEntryPoint
-    DllGetClassObject
-    DllCanUnloadNow
-    DllRegisterServer
-    DllUnregisterServer
