@@ -1,6 +1,3 @@
-*.o
-*.so
-*.dll
-*.DLL
-*.bak*
-/build/
+*.log
+*.orig
+/tmp/
