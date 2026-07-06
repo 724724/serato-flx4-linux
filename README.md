@@ -12,8 +12,10 @@ which targets the Roland DJ-808/505. This fork drops the Roland-specific pieces
 MIDI port with its USB device.
 
 > **Status:** MIDI + USB + HID hardware connection works — Serato reports
-> `***CONNECTED*** Pioneer DDJ-FLX4`. Licensing (see below) is separate from
-> hardware detection.
+> `***CONNECTED*** Pioneer DDJ-FLX4` — and **hardware-mode audio connects**
+> (`start succeeded. Device: Pioneer DDJ-FLX4`, 48 kHz, 10 ms exclusive
+> WASAPI over raw ALSA). Licensing (see below) is separate from hardware
+> detection.
 
 ---
 
@@ -88,7 +90,54 @@ Two additions to `dlls/winealsa.drv/alsamidi.c`:
   `midi_out_get_devcaps` (`0x2b73` / `0x0045`) as a belt-and-suspenders measure
   for the `MIDIINCAPS` / `MIDIOUTCAPS` path.
 
-### 3. `winmm.dll` — `midiInMessage` fallback (`wine-flx4.patch`)
+### 3. Audio: WASAPI exclusive mode over raw ALSA
+
+Getting Serato to *detect* the FLX4 is separate from getting **audio** out of
+it. Serato opens controller audio as a **WASAPI EXCLUSIVE-mode, event-driven**
+stream (`IAudioClient::Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+AUDCLNT_STREAMFLAGS_EVENTCALLBACK, ...)`). Three separate walls fall out of
+that:
+
+1. **winepulse rejects exclusive mode.** Wine's pulse backend fails every
+   exclusive-mode `IsFormatSupported`, so Serato marks the device unusable at
+   startup and each `Getting connection` attempt fails in ~3 ms without ever
+   opening the device. **Fix:** set the Wine audio driver to ALSA
+   (`HKCU\Software\Wine\Drivers  Audio=alsa`, done by `apply.sh`) and make
+   PipeWire release the FLX4 card so winealsa can open `hw:` directly:
+
+   ```
+   # ~/.config/wireplumber/wireplumber.conf.d/51-ddj-flx4.conf
+   monitor.alsa.rules = [
+     {
+       matches = [ { device.name = "~alsa_card.usb-AlphaTheta_Corporation_DDJ-FLX4.*" } ]
+       actions = { update-props = { device.disabled = true } }
+     }
+   ]
+   ```
+
+   Side benefit: FLX4 audio bypasses PipeWire entirely — no resampling, no
+   graph quantum, desktop audio untouched.
+
+2. **Wine's mmdevapi refuses EXCLUSIVE + EVENTCALLBACK.** `adjust_timing()`
+   in `dlls/mmdevapi/client.c` returns a placeholder
+   `AUDCLNT_E_DEVICE_IN_USE` for that combination (it is simply not
+   implemented). Serato's capturer uses exactly it. `wine-flx4.patch` lifts
+   the refusal and emulates the stream on Wine's shared timer-driven path
+   (validated: stable 48 kHz / 480-frame stream).
+
+3. **winealsa caps the mix format at stereo for `plughw` endpoints.** The
+   plug layer reports unconstrained channel counts (10000), so winealsa's
+   `>6 channels → force 2` fallback hides the FLX4's 4 output channels
+   (master 1/2 + headphone cue 3/4). `wine-flx4.patch` re-probes the raw
+   `hw:` device for the true channel count in `alsa_get_mix_format`.
+
+Red herrings we ruled out so you don't have to: endpoint naming (Serato's
+name lookup works fine once exclusive mode is available), ASIO (Serato never
+queries `HKLM\SOFTWARE\ASIO` for the FLX4), the WinRT microphone-permission
+error (`80040154`, cosmetic), and the `Failed to connect MIDI device!`
+popups (Serato failing to open PipeWire's virtual MIDI ports — harmless).
+
+### 4. `winmm.dll` — `midiInMessage` fallback (`wine-flx4.patch`)
 Adds the `MMDRV_PhysicalFeatures` fallback to `midiInMessage` in
 `dlls/winmm/winmm.c`, mirroring the one already present in `midiOutMessage`.
 This is what lets `DRV_QUERYDEVICEINTERFACE` reach the driver on the MIDI **input**
@@ -163,10 +212,12 @@ git apply /path/to/serato-flx4-linux/wine-flx4.patch
 ./configure --enable-win64
 make dlls/winealsa.drv/winealsa.so
 make dlls/winmm/x86_64-windows/winmm.dll
+make dlls/mmdevapi/x86_64-windows/mmdevapi.dll
 
 # Deploy (adjust paths to your distro's Wine layout)
-sudo cp dlls/winealsa.drv/winealsa.so          /usr/lib/wine/x86_64-unix/winealsa.so
-sudo cp dlls/winmm/x86_64-windows/winmm.dll    /usr/lib/wine/x86_64-windows/winmm.dll
+sudo cp dlls/winealsa.drv/winealsa.so              /usr/lib/wine/x86_64-unix/winealsa.so
+sudo cp dlls/winmm/x86_64-windows/winmm.dll        /usr/lib/wine/x86_64-windows/winmm.dll
+sudo cp dlls/mmdevapi/x86_64-windows/mmdevapi.dll  /usr/lib/wine/x86_64-windows/mmdevapi.dll
 ```
 
 The full tree build (`make`) may fail on unrelated test binaries (e.g. dwrite
@@ -181,7 +232,10 @@ tests); building the two targets above directly avoids that.
 | `<serato-dir>/libusb-1.0.dll` | Replaced with stub via `patch.sh` (original saved as `.orig`) |
 | `/usr/lib/wine/x86_64-unix/winealsa.so` | Patched (original saved as `.orig` by `apply.sh`) |
 | `/usr/lib/wine/x86_64-windows/winmm.dll` | Patched (original saved as `.orig` by `apply.sh`) |
+| `/usr/lib/wine/x86_64-windows/mmdevapi.dll` | Patched (original saved as `.orig` by `apply.sh`) |
 | Wine registry `HKLM\SYSTEM\...\Enum\USB\VID_2B73&PID_0045` | FLX4 USB device entry |
+| Wine registry `HKCU\Software\Wine\Drivers  Audio=alsa` | Audio driver → winealsa (exclusive mode) |
+| `~/.config/wireplumber/wireplumber.conf.d/51-ddj-flx4.conf` | PipeWire releases the FLX4 card (manual, see Audio section) |
 
 ---
 

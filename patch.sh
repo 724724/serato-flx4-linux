@@ -462,6 +462,7 @@ struct redir { const char *suffix; const char *local_name; };
 static const struct redir redirects[] = {
     { "/x86_64-windows/setupapi.dll", "/x86_64-windows/setupapi.dll" },
     { "/x86_64-windows/winmm.dll",    "/x86_64-windows/winmm.dll"    },
+    { "/x86_64-windows/mmdevapi.dll", "/x86_64-windows/mmdevapi.dll" },
 };
 #define NUM_REDIRECTS (sizeof(redirects)/sizeof(redirects[0]))
 
@@ -528,12 +529,11 @@ info "Step 3/8 — Building ASIO stubs..."
 # DJ-808
 RDAS_SRC="$SCRIPT_DIR/rdas808_stub.c"
 RDAS_DEF="$SCRIPT_DIR/rdas808_stub.def"
-[[ -f "$RDAS_SRC" ]] || die "rdas808_stub.c not found at $RDAS_SRC"
-[[ -f "$RDAS_DEF" ]] || die "rdas808_stub.def not found at $RDAS_DEF"
-
 RDAS_TARGET="$WINEPREFIX/drive_c/windows/system32/RDAS1174.DLL"
 
-if [[ $DRY_RUN -eq 0 ]]; then
+if [[ ! -f "$RDAS_SRC" || ! -f "$RDAS_DEF" ]]; then
+    info "rdas808_stub.c not found — skipping DJ-808 ASIO stub"
+elif [[ $DRY_RUN -eq 0 ]]; then
     x86_64-w64-mingw32-gcc -shared -O2 \
         -o "$INSTALL_DIR/x86_64-windows/RDAS1174.DLL" \
         "$RDAS_SRC" "$RDAS_DEF" \

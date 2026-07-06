@@ -1,3 +1,76 @@
+diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
+index d29969b..132b218 100644
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -163,9 +163,13 @@ static HRESULT adjust_timing(struct audio_client *client, const BOOLEAN force_de
+                 if (*duration != *period)
+                     return AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL;
+ 
+-                FIXME("EXCLUSIVE mode with EVENTCALLBACK\n");
++                FIXME("EXCLUSIVE mode with EVENTCALLBACK: emulating with timer-driven stream\n");
+ 
+-                return AUDCLNT_E_DEVICE_IN_USE;
++                /* Exclusive event-driven streams are not truly implemented;
++                 * emulate with the shared timer-driven path. Grow the internal
++                 * buffer beyond the WASAPI-mandated duration==period so the
++                 * emulation has headroom. */
++                *duration = 8 * *period;
+             } else if (*duration < 8 * *period)
+                 *duration = 8 * *period; /* May grow above 2s. */
+         }
+diff --git a/dlls/winealsa.drv/alsa.c b/dlls/winealsa.drv/alsa.c
+index 046b447..538edb2 100644
+--- a/dlls/winealsa.drv/alsa.c
++++ b/dlls/winealsa.drv/alsa.c
+@@ -2102,6 +2102,38 @@ static NTSTATUS alsa_get_mix_format(void *args)
+         goto exit;
+     }
+ 
++    if(max_channels > 6){
++        /* The endpoint is a plug device whose channel count is unconstrained
++         * (reported as 10000), so the stereo fallback above hides the real
++         * channel count of multichannel interfaces (e.g. 4ch DJ controllers).
++         * Query the underlying raw hw device instead. The plug handle holds
++         * the hw substream, so close it first. */
++        unsigned int card, dev, hw_max = 0;
++
++        free(hw_params);
++        hw_params = NULL;
++        snd_pcm_close(pcm_handle);
++        pcm_handle = NULL;
++
++        if(sscanf(params->device, "plughw:%u,%u", &card, &dev) == 2){
++            char hwname[64];
++            snd_pcm_t *hw_pcm;
++            snd_pcm_hw_params_t *hw_hp;
++
++            sprintf(hwname, "hw:%u,%u", card, dev);
++            if(SUCCEEDED(alsa_open_device(hwname, params->flow, &hw_pcm, &hw_hp))){
++                if(snd_pcm_hw_params_any(hw_pcm, hw_hp) >= 0 &&
++                   snd_pcm_hw_params_get_channels_max(hw_hp, &hw_max) >= 0 &&
++                   hw_max > 2 && hw_max <= 8 && !(hw_max & 1)){
++                    fmt->Format.nChannels = hw_max;
++                    fmt->dwChannelMask = get_channel_mask(hw_max);
++                }
++                free(hw_hp);
++                snd_pcm_close(hw_pcm);
++            }
++        }
++    }
++
+     fmt->Format.nBlockAlign = (fmt->Format.wBitsPerSample * fmt->Format.nChannels) / 8;
+     fmt->Format.nAvgBytesPerSec = fmt->Format.nSamplesPerSec * fmt->Format.nBlockAlign;
+ 
+@@ -2111,7 +2143,8 @@ static NTSTATUS alsa_get_mix_format(void *args)
+ exit:
+     free(formats);
+     free(hw_params);
+-    snd_pcm_close(pcm_handle);
++    if(pcm_handle)
++        snd_pcm_close(pcm_handle);
+ 
+     return STATUS_SUCCESS;
+ }
 diff --git a/dlls/winealsa.drv/alsamidi.c b/dlls/winealsa.drv/alsamidi.c
 index fbc65bd..3d70d74 100644
 --- a/dlls/winealsa.drv/alsamidi.c
