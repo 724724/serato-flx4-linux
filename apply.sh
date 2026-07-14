@@ -5,7 +5,8 @@
 #
 # NOTE: The libusb stub is built/deployed separately by patch.sh.
 #       If your Wine version differs from prebuilt/WINE_VERSION.txt,
-#       rebuild from wine-flx4.patch instead of using the prebuilt binaries.
+#       rebuild from wine-flx4.patch and laptop-mirror.patch instead of using
+#       the prebuilt binaries.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 

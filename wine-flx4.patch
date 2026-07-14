@@ -1,5 +1,5 @@
 diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
-index d29969b..132b218 100644
+index d29969b..947ef88 100644
 --- a/dlls/mmdevapi/client.c
 +++ b/dlls/mmdevapi/client.c
 @@ -163,9 +163,13 @@ static HRESULT adjust_timing(struct audio_client *client, const BOOLEAN force_de
@@ -10,19 +10,50 @@ index d29969b..132b218 100644
 +                FIXME("EXCLUSIVE mode with EVENTCALLBACK: emulating with timer-driven stream\n");
  
 -                return AUDCLNT_E_DEVICE_IN_USE;
-+                /* Exclusive event-driven streams are not truly implemented;
-+                 * emulate with the shared timer-driven path. Grow the internal
-+                 * buffer beyond the WASAPI-mandated duration==period so the
-+                 * emulation has headroom. */
++                /* Validate the WASAPI-mandated duration == period above, then
++                 * enlarge Wine's timer-driven emulation buffer. A one-period
++                 * buffer leaves no scheduling margin for the application
++                 * callback and produces audible underruns. */
 +                *duration = 8 * *period;
              } else if (*duration < 8 * *period)
                  *duration = 8 * *period; /* May grow above 2s. */
          }
 diff --git a/dlls/winealsa.drv/alsa.c b/dlls/winealsa.drv/alsa.c
-index 046b447..538edb2 100644
+index 046b447..e37a82e 100644
 --- a/dlls/winealsa.drv/alsa.c
 +++ b/dlls/winealsa.drv/alsa.c
-@@ -2102,6 +2102,38 @@ static NTSTATUS alsa_get_mix_format(void *args)
+@@ -882,13 +882,14 @@ static NTSTATUS alsa_create_stream(void *args)
+     stream->mmdev_period_frames = muldiv(params->fmt->nSamplesPerSec,
+             stream->mmdev_period_rt, 10000000);
+ 
+-    /* Buffer 4 ALSA periods if large enough, else 4 mmdevapi periods */
+-    stream->alsa_bufsize_frames = stream->mmdev_period_frames * 4;
++    /* Buffer 8 ALSA periods if large enough, else 8 mmdevapi periods
++     * (upstream uses 4; doubled for underrun headroom on USB devices) */
++    stream->alsa_bufsize_frames = stream->mmdev_period_frames * 8;
+     if(err < 0 || alsa_period_us < params->period / 10)
+         err = snd_pcm_hw_params_set_buffer_size_near(stream->pcm_handle,
+                 stream->hw_params, &stream->alsa_bufsize_frames);
+     else{
+-        unsigned int periods = 4;
++        unsigned int periods = 8;
+         err = snd_pcm_hw_params_set_periods_near(stream->pcm_handle, stream->hw_params, &periods, NULL);
+     }
+     if(err < 0)
+@@ -1635,6 +1636,12 @@ static NTSTATUS alsa_timer_loop(void *args)
+     struct alsa_stream *stream = handle_get_stream(params->stream);
+     LARGE_INTEGER delay, next;
+     int adjust;
++    struct sched_param sp = { .sched_priority = 10 };
++
++    /* This pump must run every period or the ALSA buffer underruns; plain
++     * SCHED_OTHER gets preempted under desktop load. Best effort — fails
++     * silently without RLIMIT_RTPRIO (realtime group). */
++    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+ 
+     alsa_lock(stream);
+ 
+@@ -2102,6 +2109,52 @@ static NTSTATUS alsa_get_mix_format(void *args)
          goto exit;
      }
  
@@ -42,6 +73,7 @@ index 046b447..538edb2 100644
 +        if(sscanf(params->device, "plughw:%u,%u", &card, &dev) == 2){
 +            char hwname[64];
 +            snd_pcm_t *hw_pcm;
++            char *card_name = NULL;
 +            snd_pcm_hw_params_t *hw_hp;
 +
 +            sprintf(hwname, "hw:%u,%u", card, dev);
@@ -52,16 +84,29 @@ index 046b447..538edb2 100644
 +                    fmt->Format.nChannels = hw_max;
 +                    fmt->dwChannelMask = get_channel_mask(hw_max);
 +                }
++
++                /* Serato's FLX4 backend renders signed 32-bit PCM samples,
++                 * but advertising FLOAT from plughw makes those bit patterns
++                 * get converted as floats, saturating the USB output. */
++                if(params->flow == eRender &&
++                   snd_pcm_format_mask_test(formats, SND_PCM_FORMAT_S32_LE) &&
++                   snd_card_get_name(card, &card_name) >= 0 && card_name &&
++                   !strcmp(card_name, "DDJ-FLX4")){
++                    fmt->Format.wBitsPerSample = 32;
++                    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
++                }
++
 +                free(hw_hp);
 +                snd_pcm_close(hw_pcm);
 +            }
++            free(card_name);
 +        }
 +    }
 +
      fmt->Format.nBlockAlign = (fmt->Format.wBitsPerSample * fmt->Format.nChannels) / 8;
      fmt->Format.nAvgBytesPerSec = fmt->Format.nSamplesPerSec * fmt->Format.nBlockAlign;
  
-@@ -2111,7 +2143,8 @@ static NTSTATUS alsa_get_mix_format(void *args)
+@@ -2111,7 +2164,8 @@ static NTSTATUS alsa_get_mix_format(void *args)
  exit:
      free(formats);
      free(hw_params);
@@ -71,6 +116,21 @@ index 046b447..538edb2 100644
  
      return STATUS_SUCCESS;
  }
+@@ -2268,6 +2322,14 @@ static NTSTATUS alsa_set_volumes(void *args)
+     struct alsa_stream *stream = handle_get_stream(params->stream);
+     unsigned int i;
+ 
++    /* Exclusive-mode streams bypass the audio engine on Windows, so session/
++     * stream volumes are not applied to the samples there. Applying them here
++     * as instantaneous gain steps (no ramp) produces a click per change —
++     * apps that ride the volume (e.g. limiters in DJ software) turn that
++     * into continuous zipper noise. Keep exclusive streams bit-exact. */
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++        return STATUS_SUCCESS;
++
+     for(i = 0; i < stream->fmt->nChannels; i++)
+         stream->vols[i] = params->volumes[i] * params->session_volumes[i] * params->master_volume;
+ 
 diff --git a/dlls/winealsa.drv/alsamidi.c b/dlls/winealsa.drv/alsamidi.c
 index fbc65bd..3d70d74 100644
 --- a/dlls/winealsa.drv/alsamidi.c

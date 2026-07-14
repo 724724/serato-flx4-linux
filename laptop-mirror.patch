@@ -1,0 +1,127 @@
+diff --git a/dlls/winealsa.drv/alsa.c b/dlls/winealsa.drv/alsa.c
+--- a/dlls/winealsa.drv/alsa.c
++++ b/dlls/winealsa.drv/alsa.c
+@@ -79,6 +79,10 @@ struct alsa_stream
+     LONG32 getbuf_last; /* <0 when using tmp_buffer */
+     float *vols;
+ 
++    snd_pcm_t *laptop_mirror;
++    INT32 *laptop_mirror_buffer;
++    snd_pcm_uframes_t laptop_mirror_buffer_frames;
++
+     pthread_mutex_t lock;
+ };
+ 
+@@ -690,6 +694,41 @@ static snd_pcm_format_t alsa_format(const WAVEFORMATEX *fmt)
+     return format;
+ }
+ 
++static void alsa_init_laptop_mirror(struct alsa_stream *stream)
++{
++    const char *enabled = getenv("WINE_FLX4_LAPTOP_MIRROR");
++    int err;
++
++    if(!enabled || strcmp(enabled, "1") || stream->flow != eRender ||
++       stream->fmt->nChannels != 4 || stream->fmt->nSamplesPerSec != 48000 ||
++       stream->alsa_format != SND_PCM_FORMAT_S32_LE)
++        return;
++
++    if((err = snd_pcm_open(&stream->laptop_mirror, "default",
++            SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)) < 0){
++        WARN("Unable to open laptop mirror: %d (%s)\n", err, snd_strerror(err));
++        stream->laptop_mirror = NULL;
++        return;
++    }
++
++    if((err = snd_pcm_set_params(stream->laptop_mirror, SND_PCM_FORMAT_S32_LE,
++            SND_PCM_ACCESS_RW_INTERLEAVED, 2, 48000, 1, 100000)) < 0){
++        WARN("Unable to configure laptop mirror: %d (%s)\n", err, snd_strerror(err));
++        snd_pcm_close(stream->laptop_mirror);
++        stream->laptop_mirror = NULL;
++        return;
++    }
++
++    stream->laptop_mirror_buffer_frames = stream->alsa_bufsize_frames;
++    stream->laptop_mirror_buffer = malloc(stream->laptop_mirror_buffer_frames *
++            2 * sizeof(*stream->laptop_mirror_buffer));
++    if(!stream->laptop_mirror_buffer){
++        snd_pcm_close(stream->laptop_mirror);
++        stream->laptop_mirror = NULL;
++        stream->laptop_mirror_buffer_frames = 0;
++    }
++}
++
+ static int alsa_channel_index(UINT flag)
+ {
+     switch(flag){
+@@ -1010,6 +1051,7 @@ static NTSTATUS alsa_create_stream(void *args)
+ 
+     stream->share = params->share;
+     stream->flags = params->flags;
++    alsa_init_laptop_mirror(stream);
+ 
+     pthread_mutex_init(&stream->lock, NULL);
+ 
+@@ -1061,6 +1103,9 @@ static NTSTATUS alsa_release_stream(void *args)
+     free(stream->hw_params);
+     free(stream->fmt);
+     free(stream->vols);
++    if(stream->laptop_mirror)
++        snd_pcm_close(stream->laptop_mirror);
++    free(stream->laptop_mirror_buffer);
+     pthread_mutex_destroy(&stream->lock);
+     free(stream);
+ 
+@@ -1261,6 +1306,39 @@ static void adjust_buffer_volume(const struct alsa_stream *stream, BYTE *buf, snd
+     }
+ }
+ 
++static void alsa_write_laptop_mirror(struct alsa_stream *stream, const BYTE *buf,
++        snd_pcm_uframes_t frames)
++{
++    const INT32 *src = (const INT32 *)buf;
++
++    while(frames){
++        snd_pcm_uframes_t chunk = min(frames, stream->laptop_mirror_buffer_frames);
++        snd_pcm_uframes_t i, offset = 0;
++
++        for(i = 0; i < chunk; ++i){
++            stream->laptop_mirror_buffer[i * 2] = src[i * 4];
++            stream->laptop_mirror_buffer[i * 2 + 1] = src[i * 4 + 1];
++        }
++
++        while(offset < chunk){
++            snd_pcm_sframes_t ret = snd_pcm_writei(stream->laptop_mirror,
++                    stream->laptop_mirror_buffer + offset * 2, chunk - offset);
++
++            if(ret == -EAGAIN)
++                return;
++            if(ret < 0){
++                if(snd_pcm_recover(stream->laptop_mirror, ret, 1) < 0)
++                    return;
++                continue;
++            }
++            offset += ret;
++        }
++
++        src += chunk * 4;
++        frames -= chunk;
++    }
++}
++
+ static snd_pcm_sframes_t alsa_write_best_effort(struct alsa_stream *stream, BYTE *buf, snd_pcm_uframes_t frames)
+ {
+     snd_pcm_sframes_t written;
+@@ -1292,8 +1373,11 @@ static snd_pcm_sframes_t alsa_write_best_effort(struct alsa_stream *stream, BYTE
+         written = snd_pcm_writei(stream->pcm_handle, buf, frames);
+     }
+ 
+-    if (written > 0)
++    if (written > 0){
+         stream->vol_adjusted_frames -= written;
++        if(stream->laptop_mirror)
++            alsa_write_laptop_mirror(stream, buf, written);
++    }
+     return written;
+ }
+ 
