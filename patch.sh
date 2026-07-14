@@ -949,7 +949,7 @@ LEOF
 fi
 
 # Desktop entry
-DESKTOP_ICON=$(find "$WINEPREFIX/drive_c" -name "*.0" -path "*Serato*" 2>/dev/null | head -1)
+DESKTOP_ICON="F151_Serato DJ Pro.0"
 if [[ $DRY_RUN -eq 0 ]]; then
     cat > "$HOME/.local/share/applications/serato-dj-pro.desktop" << DEOF
 [Desktop Entry]
@@ -961,6 +961,19 @@ Path=${SERATO_DIR}
 Icon=${DESKTOP_ICON}
 StartupWMClass=serato dj pro.exe
 DEOF
+    WINE_MENU_ENTRY="$HOME/.local/share/applications/wine/Programs/Serato/Serato DJ Pro .desktop"
+    if [[ -f "$WINE_MENU_ENTRY" ]]; then
+        python3 - "$WINE_MENU_ENTRY" << 'PYEOF'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+lines = ["NoDisplay=true" if line.startswith("NoDisplay=") else line for line in lines]
+if "NoDisplay=true" not in lines:
+    lines.append("NoDisplay=true")
+path.write_text("\n".join(lines) + "\n")
+PYEOF
+    fi
     update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null
     ok "Desktop entry updated"
 fi
