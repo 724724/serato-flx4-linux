@@ -942,6 +942,40 @@ if [[ $DRY_RUN -eq 0 ]]; then
 export WINEPREFIX="${WINEPREFIX}"
 export LD_PRELOAD="${INSTALL_DIR}/wine_open_hook.so"
 export WINE_FLX4_LAPTOP_MIRROR=1
+
+serato_window_address() {
+    hyprctl -j clients 2>/dev/null | jq -r \
+        'first(.[] | select(((.class // "") | ascii_downcase) == "serato dj pro.exe") | .address) // empty'
+}
+
+serato_focus_window() {
+    local address="\$1"
+    local workspace="\$2"
+    hyprctl eval "hl.dispatch(hl.dsp.window.move({ window = \"address:\$address\", workspace = \$workspace, follow = false })); hl.dispatch(hl.dsp.focus({ window = \"address:\$address\" }))" \
+        >/dev/null 2>&1
+}
+
+if command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    target_workspace="\$(hyprctl -j activeworkspace 2>/dev/null | jq -r '.id // empty')"
+    if [[ "\$target_workspace" =~ ^[0-9]+$ ]]; then
+        existing_address="\$(serato_window_address)"
+        if [[ -n "\$existing_address" ]]; then
+            serato_focus_window "\$existing_address" "\$target_workspace"
+            exit 0
+        fi
+        (
+            for ((i = 0; i < 300; i++)); do
+                address="\$(serato_window_address)"
+                if [[ -n "\$address" ]]; then
+                    serato_focus_window "\$address" "\$target_workspace"
+                    exit 0
+                fi
+                sleep 0.1
+            done
+        ) &
+    fi
+fi
+
 exec "${WINE_BIN}" "C:\\\\Program Files\\\\Serato\\\\Serato DJ Pro\\\\Serato DJ Pro.exe" "\$@"
 LEOF
     chmod +x "$LAUNCH_WRAPPER"
